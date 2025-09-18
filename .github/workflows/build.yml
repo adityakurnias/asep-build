@@ -1,16 +1,17 @@
-name: Build and release Aseprite
+name: Build and Release Aseprite
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
   workflow_dispatch:
+
 env:
   BUILD_TYPE: Release
 
 jobs:
   fetch-aseprite-info:
-    name: Fetch deps info
+    name: Fetch Aseprite info
     runs-on: ubuntu-latest
     outputs:
       download-link: ${{ steps.aseprite-link.outputs.download-link }}
@@ -20,9 +21,9 @@ jobs:
         id: aseprite-link
         uses: a1393323447/fetch-release@main
         with:
-            group: aseprite
-            repo: aseprite
-            match: Aseprite-.*?-Source.zip
+          group: aseprite
+          repo: aseprite
+          match: Aseprite-.*?-Source.zip
 
   create-release:
     name: Create Release
@@ -34,11 +35,30 @@ jobs:
       download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
       release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          body: |
+            # Aseprite ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+            
+            Automated build of Aseprite from official source code.
+            
+            ## Downloads
+            - **Windows x64**: `Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-Windows.zip`
+            - **Linux x64**: `Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-Linux.zip`
+            - **macOS ARM64**: `Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-macOS.zip`
+            
+            ## Installation
+            1. Download the appropriate file for your platform
+            2. Extract to desired location
+            3. Run the executable
+            
+            ## Notes
+            - Built from official Aseprite source
+            - Includes portable configuration (`aseprite.ini`)
+            - For personal/testing use only
+            - Consider purchasing from [official website](https://www.aseprite.org/) to support development
           skipIfReleaseExists: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -48,12 +68,14 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
-        matrix:
-          os: [ windows-latest, ubuntu-latest, macOS-latest ]
-        fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest, macOS-latest ]
+      fail-fast: false
+      
     steps:
-      - name: Install Dependencies
+      - name: Install Linux Dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -61,12 +83,15 @@ jobs:
           sudo apt-get install -y \
             libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
             libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+            
       - uses: actions/checkout@v4
-      - name: Install Aseprite
+      
+      - name: Clone Aseprite
         shell: bash
         run: |
           git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
-      - name: Install Skia
+          
+      - name: Download Skia
         working-directory: aseprite
         shell: bash
         run: |
@@ -81,25 +106,30 @@ jobs:
             wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
             unzip Skia-Linux-Release-x64.zip -d skia
           fi
-      - uses: aseprite/get-ninja@main
-      - uses: ilammy/msvc-dev-cmd@v1
+          
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+        
+      - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
-      - name: Generating Makefiles
+        uses: ilammy/msvc-dev-cmd@v1
+        
+      - name: Configure CMake
         shell: bash
         working-directory: aseprite
         run: |
           export enable_ccache=off
           export laf_backend=skia
           export enable_scripting=on
-
+          
           if [[ "${{ runner.os }}" == "macOS" ]] ; then
             export skia_arch=arm64
           else
             export skia_arch=x64
           fi
-
+          
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
             -DENABLE_TESTS=OFF \
             -DENABLE_SCRIPTING=$enable_scripting \
@@ -108,22 +138,39 @@ jobs:
             -DSKIA_DIR=$(realpath skia) \
             -DOPENSSL_USE_STATIC_LIBS=ON \
             -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
-      - name: Compiling
+            
+      - name: Build Aseprite
         shell: bash
         working-directory: aseprite
         run: |
           cd build && ninja
-      - name: Clean Up Build folder
+          
+      - name: Clean up build artifacts
         working-directory: aseprite/build/bin
         shell: bash
-        run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune \) -exec rm -rf {} +
-      - name: Make portable zip
+        run: |
+          # Keep only aseprite executable and data folder
+          find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune \) -exec rm -rf {} +
+          
+      - name: Create portable configuration
         working-directory: aseprite/build/bin
-        run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
-      - name: Create release
+        shell: bash
+        run: |
+          echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
+          echo "# Built on $(date)" >> aseprite.ini
+          echo "# Platform: ${{ runner.os }}" >> aseprite.ini
+          
+      - name: Create release package
         working-directory: aseprite/build/bin
-        run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
-      - name: Upload release
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
+          else
+            zip -r Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
+          fi
+          
+      - name: Upload to Release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
