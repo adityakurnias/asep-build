@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    timeout-minutes: 120
     strategy:
       matrix:
         include:
@@ -39,7 +40,9 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          build-essential \
+          clang \
+          libc++-dev \
+          libc++abi-dev \
           cmake \
           ninja-build \
           libx11-dev \
@@ -59,6 +62,12 @@ jobs:
         # VS 2022 should already be installed on windows-latest
         choco install ninja
         
+    - name: Setup environment (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CXX=clang++" >> $GITHUB_ENV
+        
     - name: Get Skia
       shell: bash
       run: |
@@ -69,29 +78,54 @@ jobs:
           SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip"
         fi
         
+        echo "Downloading Skia from: $SKIA_URL"
         curl -L "$SKIA_URL" -o skia.zip
         mkdir -p deps/skia
-        unzip skia.zip -d deps/skia
+        unzip -q skia.zip -d deps/skia
+        ls -la deps/skia/
         
     - name: Configure CMake
+      shell: bash
       run: |
         mkdir build
         cd build
-        cmake .. \
-          -G "${{ matrix.cmake_generator }}" \
-          ${{ matrix.cmake_arch }} \
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
-          -DLAF_BACKEND=skia \
-          -DSKIA_DIR=../deps/skia \
-          -DSKIA_LIBRARY_DIR=../deps/skia/out/Release-x64 \
-          -DSKIA_LIBRARY=../deps/skia/out/Release-x64/skia.lib \
-          -DCMAKE_CXX_STANDARD=17
+        
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          # Linux with Clang and libc++
+          cmake .. \
+            -G "${{ matrix.cmake_generator }}" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++" \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=../deps/skia \
+            -DSKIA_LIBRARY_DIR=../deps/skia/out/Release-x64 \
+            -DSKIA_LIBRARY=../deps/skia/out/Release-x64/libskia.a
+        else
+          # Windows with Visual Studio
+          cmake .. \
+            -G "${{ matrix.cmake_generator }}" \
+            ${{ matrix.cmake_arch }} \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=../deps/skia \
+            -DSKIA_LIBRARY_DIR=../deps/skia/out/Release-x64 \
+            -DSKIA_LIBRARY=../deps/skia/out/Release-x64/skia.lib
+        fi
           
     - name: Build Aseprite
+      shell: bash
       run: |
         cd build
-        cmake --build . --config RelWithDebInfo --parallel
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          # Linux build with Ninja
+          ninja
+        else
+          # Windows build with MSBuild
+          cmake --build . --config RelWithDebInfo --parallel 2
+        fi
         
     - name: Create portable package
       shell: bash
@@ -103,20 +137,40 @@ jobs:
           # Linux package
           cp bin/aseprite ../package/
           cp -r ../data ../package/
+          
+          # Create wrapper script for Linux
+          cat > ../package/aseprite.sh << 'EOF'
+          #!/bin/bash
+          DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
+          exec "$DIR/aseprite" "$@"
+          EOF
+          chmod +x ../package/aseprite.sh
+          
           # Copy required libraries
           mkdir -p ../package/lib
-          ldd bin/aseprite | grep "=> /" | awk '{print $3}' | grep -v "^/lib\|^/usr/lib" | xargs -I '{}' cp -v '{}' ../package/lib/ || true
+          ldd bin/aseprite | grep "=> /" | awk '{print $3}' | grep -v "^/lib\|^/usr/lib" | xargs -I '{}' cp -v '{}' ../package/lib/ 2>/dev/null || true
         else
-          # Windows package
-          cp bin/RelWithDebInfo/aseprite.exe ../package/
+          # Windows package - check both possible output locations
+          if [ -f "bin/aseprite.exe" ]; then
+            cp bin/aseprite.exe ../package/
+            cp bin/*.dll ../package/ 2>/dev/null || true
+          elif [ -f "bin/RelWithDebInfo/aseprite.exe" ]; then
+            cp bin/RelWithDebInfo/aseprite.exe ../package/
+            cp bin/RelWithDebInfo/*.dll ../package/ 2>/dev/null || true
+          else
+            echo "Could not find aseprite.exe"
+            ls -la bin/
+            ls -la bin/RelWithDebInfo/ 2>/dev/null || true
+            exit 1
+          fi
           cp -r ../data ../package/
-          # Copy runtime libraries
-          cp bin/RelWithDebInfo/*.dll ../package/ 2>/dev/null || true
         fi
         
         # Create version info
         echo "Aseprite built on $(date)" > ../package/BUILD_INFO.txt
         echo "Platform: ${{ matrix.name }}" >> ../package/BUILD_INFO.txt
+        echo "Commit: $(git rev-parse HEAD)" >> ../package/BUILD_INFO.txt
         
     - name: Create archive
       shell: bash
