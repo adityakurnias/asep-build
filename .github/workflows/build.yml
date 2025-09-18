@@ -1,254 +1,132 @@
-name: Build and Release Aseprite
+name: Build and release Aseprite
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
+env:
+  BUILD_TYPE: Release
 
 jobs:
-  build:
-    timeout-minutes: 120
-    strategy:
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            cmake_generator: "Visual Studio 17 2022"
-            cmake_arch: -A x64
-            artifact_name: aseprite-windows-x64
-            executable_ext: .exe
-          - name: Linux
-            os: ubuntu-latest
-            cmake_generator: Ninja
-            cmake_arch: ""
-            artifact_name: aseprite-linux-x64
-            executable_ext: ""
-    
-    runs-on: ${{ matrix.os }}
-    
-    steps:
-    - name: Checkout Aseprite
-      uses: actions/checkout@v4
-      with:
-        repository: aseprite/aseprite
-        ref: main
-        submodules: recursive
-        
-    - name: Install dependencies (Linux)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          clang \
-          libc++-dev \
-          libc++abi-dev \
-          cmake \
-          ninja-build \
-          libx11-dev \
-          libxcursor-dev \
-          libxi-dev \
-          libgl1-mesa-dev \
-          libfontconfig1-dev
-          
-    - name: Setup Visual Studio (Windows)
-      if: matrix.os == 'windows-latest'
-      uses: microsoft/setup-msbuild@v1.0.2
-      
-    - name: Install dependencies (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        # Install required Visual Studio components
-        # VS 2022 should already be installed on windows-latest
-        choco install ninja
-        
-    - name: Setup environment (Linux)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        echo "CC=clang" >> $GITHUB_ENV
-        echo "CXX=clang++" >> $GITHUB_ENV
-        
-    - name: Get Skia
-      shell: bash
-      run: |
-        # Download prebuilt Skia
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Linux-Release-x64-libc++.zip"
-        else
-          SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip"
-        fi
-        
-        echo "Downloading Skia from: $SKIA_URL"
-        curl -L "$SKIA_URL" -o skia.zip
-        mkdir -p deps/skia
-        unzip -q skia.zip -d deps/skia
-        ls -la deps/skia/
-        
-    - name: Configure CMake
-      shell: bash
-      run: |
-        mkdir build
-        cd build
-        
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          # Linux with Clang and libc++
-          cmake .. \
-            -G "${{ matrix.cmake_generator }}" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++" \
-            -DLAF_BACKEND=skia \
-            -DSKIA_DIR=../deps/skia \
-            -DSKIA_LIBRARY_DIR=../deps/skia/out/Release-x64 \
-            -DSKIA_LIBRARY=../deps/skia/out/Release-x64/libskia.a
-        else
-          # Windows with Visual Studio
-          cmake .. \
-            -G "${{ matrix.cmake_generator }}" \
-            ${{ matrix.cmake_arch }} \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DLAF_BACKEND=skia \
-            -DSKIA_DIR=../deps/skia \
-            -DSKIA_LIBRARY_DIR=../deps/skia/out/Release-x64 \
-            -DSKIA_LIBRARY=../deps/skia/out/Release-x64/skia.lib
-        fi
-          
-    - name: Build Aseprite
-      shell: bash
-      run: |
-        cd build
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          # Linux build with Ninja
-          ninja
-        else
-          # Windows build with MSBuild
-          cmake --build . --config RelWithDebInfo --parallel 2
-        fi
-        
-    - name: Create portable package
-      shell: bash
-      run: |
-        cd build
-        mkdir -p ../package
-        
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          # Linux package
-          cp bin/aseprite ../package/
-          cp -r ../data ../package/
-          
-          # Create wrapper script for Linux
-          cat > ../package/aseprite.sh << 'EOF'
-          #!/bin/bash
-          DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
-          exec "$DIR/aseprite" "$@"
-          EOF
-          chmod +x ../package/aseprite.sh
-          
-          # Copy required libraries
-          mkdir -p ../package/lib
-          ldd bin/aseprite | grep "=> /" | awk '{print $3}' | grep -v "^/lib\|^/usr/lib" | xargs -I '{}' cp -v '{}' ../package/lib/ 2>/dev/null || true
-        else
-          # Windows package - check both possible output locations
-          if [ -f "bin/aseprite.exe" ]; then
-            cp bin/aseprite.exe ../package/
-            cp bin/*.dll ../package/ 2>/dev/null || true
-          elif [ -f "bin/RelWithDebInfo/aseprite.exe" ]; then
-            cp bin/RelWithDebInfo/aseprite.exe ../package/
-            cp bin/RelWithDebInfo/*.dll ../package/ 2>/dev/null || true
-          else
-            echo "Could not find aseprite.exe"
-            ls -la bin/
-            ls -la bin/RelWithDebInfo/ 2>/dev/null || true
-            exit 1
-          fi
-          cp -r ../data ../package/
-        fi
-        
-        # Create version info
-        echo "Aseprite built on $(date)" > ../package/BUILD_INFO.txt
-        echo "Platform: ${{ matrix.name }}" >> ../package/BUILD_INFO.txt
-        echo "Commit: $(git rev-parse HEAD)" >> ../package/BUILD_INFO.txt
-        
-    - name: Create archive
-      shell: bash
-      run: |
-        cd package
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          tar -czf ../${{ matrix.artifact_name }}.tar.gz *
-        else
-          powershell Compress-Archive -Path * -DestinationPath ../${{ matrix.artifact_name }}.zip
-        fi
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.artifact_name }}
-        path: |
-          ${{ matrix.artifact_name }}.tar.gz
-          ${{ matrix.artifact_name }}.zip
-        retention-days: 7
-
-  release:
-    needs: build
+  fetch-aseprite-info:
+    name: Fetch deps info
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    
+    outputs:
+      download-link: ${{ steps.aseprite-link.outputs.download-link }}
+      release-tag: ${{ steps.aseprite-link.outputs.release-tag }}
     steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        name: Aseprite ${{ github.ref_name }}
-        body: |
-          ## Aseprite Build ${{ github.ref_name }}
-          
-          Automated build of Aseprite for multiple platforms using:
-          - **Windows**: Visual Studio Community 2022 + Windows 11 SDK
-          - **Linux**: GCC + Ninja build system
-          
-          ### Downloads
-          - **Windows x64**: `aseprite-windows-x64.zip`
-          - **Linux x64**: `aseprite-linux-x64.tar.gz`
-          
-          ### Requirements
-          
-          **Windows:**
-          - Windows 10/11 x64
-          - Visual C++ 2015-2022 Redistributable (may be required)
-          
-          **Linux:**
-          - Ubuntu 20.04+ or equivalent
-          - X11 display server
-          - OpenGL support
-          
-          ### Installation
-          
-          **Windows:**
-          1. Download `aseprite-windows-x64.zip`
-          2. Extract to desired location
-          3. Run `aseprite.exe`
-          
-          **Linux:**
-          1. Download `aseprite-linux-x64.tar.gz`
-          2. Extract: `tar -xzf aseprite-linux-x64.tar.gz`
-          3. Make executable: `chmod +x aseprite`
-          4. Run: `./aseprite`
-          
-          ### Notes
-          - Built from official Aseprite source code
-          - Uses Visual Studio 2022 as recommended by Aseprite docs
-          - These builds are for personal/testing use only
-          - Consider purchasing from [official website](https://www.aseprite.org/) to support development
-          - Built on: ${{ github.run_id }}
-        files: |
-          aseprite-windows-x64/aseprite-windows-x64.zip
-          aseprite-linux-x64/aseprite-linux-x64.tar.gz
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch Aseprite release link
+        id: aseprite-link
+        uses: a1393323447/fetch-release@main
+        with:
+            group: aseprite
+            repo: aseprite
+            match: Aseprite-.*?-Source.zip
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: fetch-aseprite-info
+    permissions:
+      contents: write
+    outputs:
+      download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
+      release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          skipIfReleaseExists: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-aseprite:
+    name: Build Aseprite
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+        matrix:
+          os: [ windows-latest, ubuntu-latest, macOS-latest ]
+        fail-fast: false
+    steps:
+      - name: Install Dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+      - uses: actions/checkout@v4
+      - name: Install Aseprite
+        shell: bash
+        run: |
+          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
+      - name: Install Skia
+        working-directory: aseprite
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            choco install wget -y --no-progress
+            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
+            unzip Skia-Windows-Release-x64.zip -d skia
+          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
+            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
+            unzip Skia-macOS-Release-arm64.zip -d skia
+          else
+            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
+            unzip Skia-Linux-Release-x64.zip -d skia
+          fi
+      - uses: aseprite/get-ninja@main
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Generating Makefiles
+        shell: bash
+        working-directory: aseprite
+        run: |
+          export enable_ccache=off
+          export laf_backend=skia
+          export enable_scripting=on
+
+          if [[ "${{ runner.os }}" == "macOS" ]] ; then
+            export skia_arch=arm64
+          else
+            export skia_arch=x64
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=$enable_scripting \
+            -DENABLE_CCACHE=$enable_ccache \
+            -DLAF_BACKEND=$laf_backend \
+            -DSKIA_DIR=$(realpath skia) \
+            -DOPENSSL_USE_STATIC_LIBS=ON \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+      - name: Compiling
+        shell: bash
+        working-directory: aseprite
+        run: |
+          cd build && ninja
+      - name: Clean Up Build folder
+        working-directory: aseprite/build/bin
+        shell: bash
+        run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune \) -exec rm -rf {} +
+      - name: Make portable zip
+        working-directory: aseprite/build/bin
+        run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
+      - name: Create release
+        working-directory: aseprite/build/bin
+        run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
+      - name: Upload release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
+          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
+          tag: ${{ needs.create-release.outputs.release-tag }}
