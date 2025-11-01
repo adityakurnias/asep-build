@@ -141,10 +141,139 @@ jobs:
           path: aseprite/build/bin/Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-${{ runner.os }}.zip
           retention-days: 1
 
+  build-appimage:
+    name: Build AppImage
+    needs: fetch-aseprite-info
+    runs-on: ubuntu-20.04
+    timeout-minutes: 90
+    outputs:
+      release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+      
+    steps:
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev \
+            libxrandr-dev file
+            
+      - uses: actions/checkout@v4
+      
+      - name: Clone Aseprite
+        shell: bash
+        run: |
+          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          
+      - name: Download Skia
+        working-directory: aseprite
+        shell: bash
+        run: |
+          wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
+          unzip Skia-Linux-Release-x64.zip -d skia
+          
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+        
+      - name: Configure CMake
+        shell: bash
+        working-directory: aseprite
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=$(realpath skia) \
+            -DOPENSSL_USE_STATIC_LIBS=ON \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64)
+            
+      - name: Build Aseprite
+        shell: bash
+        working-directory: aseprite
+        run: |
+          cd build && ninja
+          
+      - name: Prepare AppImage directory
+        shell: bash
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          mkdir -p AppDir/usr/share/aseprite
+          
+      - name: Install Aseprite files
+        shell: bash
+        run: |
+          # Copy binary
+          cp aseprite/build/bin/aseprite AppDir/usr/bin/
+          
+          # Copy data folder
+          cp -r aseprite/build/bin/data AppDir/usr/share/aseprite/
+          
+          # Create desktop entry
+          cat > AppDir/usr/share/applications/aseprite.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Aseprite
+          GenericName=Sprite Editor
+          Comment=Animated sprite editor & pixel art tool
+          Exec=aseprite %F
+          Icon=aseprite
+          Terminal=false
+          Type=Application
+          Categories=Graphics;2DGraphics;RasterGraphics;
+          MimeType=image/bmp;image/gif;image/jpeg;image/jpg;image/png;image/x-pcx;image/x-tga;image/x-targa;
+          EOF
+          
+          # Extract icon from Aseprite data
+          if [ -f "aseprite/build/bin/data/icons/ase256.png" ]; then
+            cp aseprite/build/bin/data/icons/ase256.png AppDir/usr/share/icons/hicolor/256x256/apps/aseprite.png
+          elif [ -f "aseprite/src/desktop/linux/256x256/apps/aseprite.png" ]; then
+            cp aseprite/src/desktop/linux/256x256/apps/aseprite.png AppDir/usr/share/icons/hicolor/256x256/apps/
+          fi
+          
+          # Create AppRun script
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+          export ASEPRITE_USER_FOLDER="${HOME}/.config/aseprite"
+          cd "${HERE}/usr/share/aseprite"
+          exec "${HERE}/usr/bin/aseprite" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          
+          # Copy icon and desktop file to root
+          cp AppDir/usr/share/applications/aseprite.desktop AppDir/
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/aseprite.png AppDir/
+          
+      - name: Download appimagetool
+        shell: bash
+        run: |
+          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          
+      - name: Create AppImage
+        shell: bash
+        run: |
+          ./appimagetool-x86_64.AppImage AppDir Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-Linux-x86_64.AppImage
+          chmod +x Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-Linux-x86_64.AppImage
+          
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-AppImage
+          path: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-Linux-x86_64.AppImage
+          retention-days: 1
+
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: build-aseprite
+    needs: [build-aseprite, build-appimage]
     permissions:
       contents: write
     steps:
@@ -166,18 +295,32 @@ jobs:
             
             ## Downloads
             - **Windows x64**: `Aseprite-${{ needs.build-aseprite.outputs.release-tag }}-Windows.zip`
-            - **Linux x64**: `Aseprite-${{ needs.build-aseprite.outputs.release-tag }}-Linux.zip`
+            - **Linux x64 (Portable)**: `Aseprite-${{ needs.build-aseprite.outputs.release-tag }}-Linux.zip`
+            - **Linux x64 (AppImage)**: `Aseprite-${{ needs.build-aseprite.outputs.release-tag }}-Linux-x86_64.AppImage`
             - **macOS ARM64**: `Aseprite-${{ needs.build-aseprite.outputs.release-tag }}-macOS.zip`
             
             ## Installation
-            1. Download the appropriate file for your platform
+            
+            ### Windows & macOS
+            1. Download the appropriate ZIP file for your platform
             2. Extract to desired location
             3. Run the executable
             
+            ### Linux (AppImage)
+            1. Download the AppImage file
+            2. Make it executable: `chmod +x Aseprite-*.AppImage`
+            3. Run it: `./Aseprite-*.AppImage`
+            
+            ### Linux (Portable)
+            1. Download the ZIP file
+            2. Extract to desired location
+            3. Run: `./aseprite`
+            
             ## Notes
             - Built from official Aseprite source
-            - Includes portable configuration (`aseprite.ini`)
+            - Portable builds include `aseprite.ini` for portable configuration
+            - AppImage is self-contained and includes all dependencies
             - For personal/testing use only
             - Consider purchasing from [official website](https://www.aseprite.org/) to support development
-          artifacts: "artifacts/**/*.zip"
+          artifacts: "artifacts/**/*"
           token: ${{ secrets.GITHUB_TOKEN }}
